@@ -1,7 +1,7 @@
 import streamlit as st
 import requests
 
-API_URL = "http://127.0.0.1:8000"
+API_URL = "https://full-stack-rag-chatbot-with-memory.onrender.com"
 
 st.title("Document Chatbot")
 
