@@ -22,7 +22,7 @@ print("Loading embeddings...")
 embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
 
 print("Loading FAISS index...")
-CHROMA_PATH = "../chroma_index"
+CHROMA_PATH = "chroma_index"
 db = Chroma(persist_directory=CHROMA_PATH, embedding_function=embeddings)
 
 llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0.7)
