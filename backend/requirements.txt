@@ -7,3 +7,6 @@ langchain-community
 langchain-huggingface
 langchain-groq
 chromadb
+sentence-transformers
+pypdf
+requests
