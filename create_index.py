@@ -9,8 +9,8 @@ from langchain_community.vectorstores import Chroma
 from langchain_huggingface import HuggingFaceEmbeddings
 import os
 
-DATA_PATH = "../knowledge_base"
-CHROMA_PATH = "../chroma_index"
+DATA_PATH = "knowledge_base"
+CHROMA_PATH = "chroma_index"
 
 print("📂 Loading documents...")
 
