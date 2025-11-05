@@ -1,11 +1,12 @@
 import os
 import psycopg2
 from dotenv import load_dotenv
+from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-# RAG Imports
+# LangChain + RAG imports
 from langchain_community.vectorstores import Chroma
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_classic.chains import create_retrieval_chain
@@ -13,55 +14,78 @@ from langchain_classic.chains.combine_documents import create_stuff_documents_ch
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.messages import HumanMessage, AIMessage
 from langchain_groq import ChatGroq
-# Load .env file from the parent directory
+
+# Load environment variables
 load_dotenv()
 DB_URL = os.getenv("DATABASE_URL")
 os.environ["GROQ_API_KEY"] = os.getenv("GROQ_API_KEY")
 
-print("Loading embeddings...")
-embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+# ---- GLOBALS ----
+rag_chain = None
+retriever = None
+db = None
 
-print("Loading FAISS index...")
-CHROMA_PATH = "chroma_index"
-db = Chroma(persist_directory=CHROMA_PATH, embedding_function=embeddings)
 
-llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0.7)
-print(llm.invoke("Say hello in one word"))
-retriever = db.as_retriever(search_kwargs={"k": 3})
+# ✅ NEW lifespan handler (replaces deprecated @app.on_event)
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Initialize resources at startup and clean up on shutdown."""
+    global rag_chain, retriever, db
+    try:
+        print("🚀 Initializing RAG components...")
 
-SYSTEM_PROMPT = '''
-You are a helpful assistant.
-Use the context to answer the question in max three sentences.
-If you don't know , just say don't know.
-Context: {context}
-Chat History: {chat_history}
-'''
+        embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+        CHROMA_PATH = "chroma_index"
+        db = Chroma(persist_directory=CHROMA_PATH, embedding_function=embeddings)
+        retriever = db.as_retriever(search_kwargs={"k": 3})
 
-prompt = ChatPromptTemplate.from_messages(
-    [
-        ("system", SYSTEM_PROMPT),
-        ("human", "{input}"),
-    ]
-)
+        llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0.7)
+        print("🤖 LLM initialized successfully!")
 
-qa_chain = create_stuff_documents_chain(llm, prompt)
-rag_chain = create_retrieval_chain(retriever, qa_chain)
+        SYSTEM_PROMPT = '''
+        You are a helpful assistant.
+        Use the context to answer the question in max three sentences.
+        If you don't know, just say you don't know.
+        Context: {context}
+        Chat History: {chat_history}
+        '''
 
-print("RAG chain created.")
+        prompt = ChatPromptTemplate.from_messages(
+            [("system", SYSTEM_PROMPT), ("human", "{input}")]
+        )
 
-app = FastAPI()
+        qa_chain = create_stuff_documents_chain(llm, prompt)
+        rag_chain = create_retrieval_chain(retriever, qa_chain)
 
+        print("✅ RAG chain initialized successfully!")
+    except Exception as e:
+        print(f"❌ Error initializing RAG system: {e}")
+
+    # Yield control to FastAPI while keeping resources alive
+    yield
+
+    # Shutdown cleanup
+    print("🧹 Cleaning up resources...")
+
+
+# ✅ Create FastAPI app with lifespan
+app = FastAPI(lifespan=lifespan)
+
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"]
 )
+
+
+# ---- DATABASE ----
 def get_db_conn():
-    conn = psycopg2.connect(DB_URL)
-    return conn
+    return psycopg2.connect(DB_URL)
 
 
+# ---- MODELS ----
 class QueryRequest(BaseModel):
     user_id: int
     text: str
@@ -74,79 +98,75 @@ class HistoryRequest(BaseModel):
 class UserRequest(BaseModel):
     username: str
 
-#api endpoint
 
-#login/signup
-
+# ---- ROUTES ----
 @app.post("/get_or_create_user")
 def get_or_create_user(req: UserRequest):
     conn = get_db_conn()
     cur = conn.cursor()
-    
-    # 1. Try to find the user
     cur.execute("SELECT id FROM users WHERE username = %s", (req.username,))
-    user_row = cur.fetchone() #(1,)
+    user_row = cur.fetchone()
 
-    
     if user_row:
-        user_id = user_row[0] #1
+        user_id = user_row[0]
     else:
-        # 2. If not found, create them
         cur.execute("INSERT INTO users (username) VALUES (%s) RETURNING id", (req.username,))
+        user_id = cur.fetchone()[0]
         conn.commit()
-        user_id = cur.fetchone()[0] #2
-        
+
     cur.close()
     conn.close()
     return {"user_id": user_id, "username": req.username}
 
-#chat history
 
 @app.post("/get_history")
-def get_history(req:HistoryRequest):
+def get_history(req: HistoryRequest):
     conn = get_db_conn()
     cur = conn.cursor()
-    
     cur.execute("SELECT prompt, answer FROM chat_history WHERE user_id = %s ORDER BY id ASC", (req.user_id,))
-    history = cur.fetchall() #[("hi","hello how i can help you"),("hi","hello how i can help you")]
-    
+    history = cur.fetchall()
     cur.close()
     conn.close()
-    
-    # Format for frontend
+
     formatted_history = []
     for p, a in history:
         formatted_history.append({"role": "human", "content": p})
         formatted_history.append({"role": "ai", "content": a})
-
-    #[{"role": "human", "content": "hi"}, {"role": "ai", "content": "hello how i can help you"}, {"role": "human", "content": "hi"}, {"role": "ai", "content": "hello how i can help you"}]
     return {"history": formatted_history}
+
 
 @app.post("/query")
 def query_rag(req: QueryRequest):
-    conn=get_db_conn()
-    cur=conn.cursor()
+    global rag_chain
+    if rag_chain is None:
+        return {"answer": "RAG system not initialized yet. Please wait a few seconds and retry."}
+
+    conn = get_db_conn()
+    cur = conn.cursor()
     cur.execute("SELECT prompt, answer FROM chat_history WHERE user_id = %s ORDER BY id ASC", (req.user_id,))
-    db_history = cur.fetchall() #[("hi","hello how i can help you"),("what is web scraping","Web scraping is extraction of data ...")]
-    
+    db_history = cur.fetchall()
+
     chat_history_messages = []
     for prompt, answer in db_history:
         chat_history_messages.append(HumanMessage(content=prompt))
         chat_history_messages.append(AIMessage(content=answer))
-    
-    response = rag_chain.invoke({
-        "input": req.text,
-        "chat_history": chat_history_messages
-    })
-    answer = response.get("answer", "No answer found.")
-    
-    # Save new Q&A to database
-    cur.execute("INSERT INTO chat_history (user_id, prompt, answer) VALUES (%s, %s, %s)", (req.user_id, req.text, answer))
-    conn.commit()  
+
+    try:
+        response = rag_chain.invoke({"input": req.text, "chat_history": chat_history_messages})
+        answer = response.get("answer", "No answer found.")
+    except Exception as e:
+        answer = f"Error during retrieval: {str(e)}"
+
+    cur.execute(
+        "INSERT INTO chat_history (user_id, prompt, answer) VALUES (%s, %s, %s)",
+        (req.user_id, req.text, answer)
+    )
+    conn.commit()
     cur.close()
     conn.close()
-
     return {"answer": answer}
+
+
 @app.get("/")
 def read_root():
-    return {"message": "welcome to fastapi.go to /docs to get started"}
+    return {"message": "✅ FastAPI running! Go to /docs to test endpoints."}
